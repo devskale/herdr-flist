@@ -12,7 +12,7 @@ A live file listing that follows the focused pane's working directory.
                  `ssh dest 'ls <that path>'`.
 
 Long-running: owns its pane, redraws only when the view changes. See
-herdr-extension-guide.md.
+PLUGINS.md.
 """
 from __future__ import annotations
 

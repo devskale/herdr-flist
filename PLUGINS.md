@@ -1,4 +1,4 @@
-# Building Herdr Extensions — a field guide
+# Building Herdr Plugins — a field guide
 
 A practical, verified walkthrough of the Herdr plugin system, built around a real
 plugin: a **filelist row** that follows the focused pane's working directory,
@@ -24,7 +24,7 @@ plugin API. A plugin command is an argv that Herdr spawns; inside it you call
 back into Herdr through `$HERDR_BIN_PATH` (or the raw socket). Most plugins are a
 shell script, a Node script, or a small binary.
 
-Four extension points, all declared in the manifest:
+Four plugin surfaces, all declared in the manifest:
 
 | Surface      | What it is                                                       |
 |--------------|------------------------------------------------------------------|
@@ -276,7 +276,7 @@ herdr-flist/
   herdr-plugin.toml   # manifest (one pane "row", one action "open")
   filelist.py         # the pane command: a long-running redraw loop
   README.md
-  EXTENDING.md        # this guide
+  PLUGINS.md        # this guide
   LICENSE             # MIT
 ```
 

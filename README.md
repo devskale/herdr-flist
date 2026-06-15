@@ -66,7 +66,7 @@ seconds.
 - Tunables (environment variables): `HERDR_FILELIST_INTERVAL` (default `1`s),
   `HERDR_FILELIST_REMOTE_CACHE` (`3`s), `HERDR_FILELIST_SSH_TIMEOUT` (`5`s).
 
-See `EXTENDING.md` for a field guide to the Herdr plugin model built around this
+See `PLUGINS.md` for a field guide to the Herdr plugin model built around this
 plugin — manifest contract, injected environment, where pane cwd comes from, and
 the SSH cwd gap that motivated the prompt-parsing approach.
 
