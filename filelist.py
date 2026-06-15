@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run
 """filelist.py — herdr plugin pane command (entrypoint id "row").
 
 A live file listing that follows the focused pane's working directory.
@@ -14,6 +14,11 @@ A live file listing that follows the focused pane's working directory.
 Long-running: owns its pane, redraws only when the view changes. See
 PLUGINS.md.
 """
+# /// script
+# requires-python = ">=3.9"
+# dependencies = []
+# description = "herdr-flist: a filelist row that follows the focused pane's cwd."
+# ///
 from __future__ import annotations
 
 import json

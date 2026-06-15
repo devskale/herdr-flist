@@ -13,7 +13,8 @@ remote host.
 
 ## Setup
 
-Requires `python3` (stdlib only). SSH panes need passwordless key auth to the
+Requires `uv` (runs the single-file script with PEP 723 metadata; a plain
+`python3 filelist.py` also works). SSH panes need passwordless key auth to the
 remote host (`ssh-copy-id`), since the remote listing runs non-interactively with
 `BatchMode=yes`.
 
@@ -60,7 +61,8 @@ description = "open filelist row"
 
 ## Notes
 
-- Single file, no pip dependencies: `filelist.py`.
+- Single file, no pip dependencies: `filelist.py` (run via `uv run`, PEP 723
+  inline metadata declares `requires-python = ">=3.9"` and no deps).
 - Recognizes common prompt shapes: `user@host:~/path$`, bare `~/path$`, `/path>`.
 - Tunables (environment variables): `HERDR_FILELIST_INTERVAL` (default `1`s),
   `HERDR_FILELIST_REMOTE_CACHE` (`3`s), `HERDR_FILELIST_SSH_TIMEOUT` (`5`s).
