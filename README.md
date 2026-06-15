@@ -3,6 +3,14 @@
 Python Herdr plugin that opens a filelist row under the focused pane and follows
 its working directory — locally and over SSH.
 
+<p align="center">
+  <img src="docs/img/filelist-ssh.png" alt="herdr-flist following an SSH pane into ~/code/pinet on lubuntu.local" width="520" />
+</p>
+
+The row follows the focused pane. Over SSH it parses the remote cwd from the
+focused pane's own shell prompt, so it tracks `cd` into subdirectories on the
+remote host.
+
 ## Setup
 
 Requires `python3` (stdlib only). SSH panes need passwordless key auth to the
