@@ -1,0 +1,26 @@
+# herdr plugin manifest — see README.md and EXTENDING.md
+id = "herdr-flist"
+name = "herdr-flist"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "A filelist row that follows the focused pane's cwd — locally or over SSH."
+platforms = ["linux", "macos"]
+
+# The pane itself. placement = "split" opened with --direction down renders as a
+# horizontal row beneath the focused pane. There is no dedicated thin "row"
+# placement in herdr; a split is the closest fit. See EXTENDING.md §3.
+[[panes]]
+id = "row"
+title = "Files"
+description = "File list of the focused pane's cwd (local or over SSH)."
+placement = "split"
+command = ["python3", "filelist.py"]
+
+# Convenience action: open the filelist row beside the focused pane without
+# stealing focus. Actions just run an argv; we call back into herdr via
+# $HERDR_BIN_PATH.
+[[actions]]
+id = "open"
+title = "Open filelist row"
+contexts = ["workspace", "tab", "pane"]
+command = ["sh", "-c", "\"$HERDR_BIN_PATH\" plugin pane open --plugin herdr-flist --entrypoint row --placement split --direction down --no-focus"]
