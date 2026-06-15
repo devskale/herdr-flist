@@ -28,6 +28,9 @@ HERDR = os.environ.get("HERDR_BIN_PATH", "herdr")
 INTERVAL = float(os.environ.get("HERDR_FILELIST_INTERVAL", "1"))
 REMOTE_CACHE = float(os.environ.get("HERDR_FILELIST_REMOTE_CACHE", "3"))
 SSH_TIMEOUT = float(os.environ.get("HERDR_FILELIST_SSH_TIMEOUT", "5"))
+# On startup, narrow this pane toward this fraction of its parent region so it
+# reads as a sidebar column instead of a 50/50 split. 0 disables self-sizing.
+SIDEBAR_FRACTION = float(os.environ.get("HERDR_FILELIST_WIDTH", "0.3"))
 SELF_TOKEN = os.path.basename(__file__)  # for "this pane is me" detection
 
 # --- ANSI -----------------------------------------------------------------
@@ -92,6 +95,41 @@ def fg_info(pane_id):
     p = procs[0]
     argv = p.get("argv") or (p.get("cmdline", "").split() if p.get("cmdline") else [])
     return p.get("name", ""), " ".join(argv), p.get("cwd")
+
+
+# --- self-sizing into a sidebar column -------------------------------
+def narrow_self():
+    """Shrink this pane toward SIDEBAR_FRACTION of its parent region.
+
+    A fresh right split is 50/50, too wide for a file list. We read the live
+    layout, compute the fraction delta, and issue one `pane resize` whose
+    amount is that delta (verified empirically: a right-resize of amount D
+    drops the pane's width fraction by ~D). No-op if already narrow enough or
+    if HERDR_PANE_ID is unset.
+    """
+    if not (0 < SIDEBAR_FRACTION < 0.5):
+        return
+    pane_id = os.environ.get("HERDR_PANE_ID", "")
+    if not pane_id:
+        return
+    d = herdr_json(["pane", "layout"])
+    layout = (d or {}).get("result", {}).get("layout", {}) if isinstance(d, dict) else {}
+    area = layout.get("area", {})
+    me = next(
+        (p for p in layout.get("panes", []) if p.get("pane_id") == pane_id), None
+    )
+    if not me or not area.get("width") or not me["rect"].get("width"):
+        return
+    parent_w = float(area["width"])
+    cur_frac = float(me["rect"]["width"]) / parent_w
+    if cur_frac <= SIDEBAR_FRACTION + 0.02:
+        return
+    delta = cur_frac - SIDEBAR_FRACTION
+    subprocess.run(
+        [HERDR, "pane", "resize", "--pane", pane_id,
+         "--direction", "right", "--amount", f"{delta:.4f}"],
+        capture_output=True, text=True,
+    )
 
 
 def pane_text(pane_id, lines=80):
@@ -309,6 +347,7 @@ def main():
     last = {"pid": None, "cwd": None, "kind": None, "ssh": None}
     last_render = ""
 
+    narrow_self()
     sys.stdout.write("\033[?25l")  # hide cursor
     sys.stdout.flush()
 
