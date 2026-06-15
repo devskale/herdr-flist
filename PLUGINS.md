@@ -53,7 +53,7 @@ platforms = ["linux", "macos"]    # recommended; omitting only warns
 id = "row"                        # local id. [a-z0-9 : _ -] — NO dots. unique.
 title = "Files"                   # becomes the pane label
 placement = "split"               # overlay | split | tab | zoomed (default overlay)
-command = ["python3", "filelist.py"] # argv, NOT run through a shell
+command = ["uv", "run", "filelist.py"] # argv, NOT run through a shell
 ```
 
 Exact validation rules (verified in `manifest.rs::normalize_*`):

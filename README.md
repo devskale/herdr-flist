@@ -4,7 +4,7 @@ Python Herdr plugin that opens a filelist row under the focused pane and follows
 its working directory — locally and over SSH.
 
 <p align="center">
-  <img src="docs/img/filelist-ssh.png" alt="herdr-flist following an SSH pane into ~/code/pinet on lubuntu.local" width="520" />
+  <img src="docs/img/filelist-sidebar.png" alt="herdr-flist docked as a right sidebar, following an SSH pane into ~/code/pinet on lubuntu.local" width="640" />
 </p>
 
 The row follows the focused pane. Over SSH it parses the remote cwd from the
@@ -32,8 +32,10 @@ herdr plugin install devskale/herdr-flist
 
 ## Behavior
 
-Running the `open` action splits the focused pane downward (without stealing
-focus) and renders a live listing of the focused pane's cwd:
+Running the `open` action splits the focused pane to the right (without
+stealing focus) and renders a live listing of the focused pane's cwd. The pane
+self-narrows to a sidebar width on startup, so it docks as a right column rather
+than a 50/50 split:
 
 ```sh
 herdr plugin action invoke open --plugin herdr-flist
@@ -64,8 +66,10 @@ description = "open filelist row"
 - Single file, no pip dependencies: `filelist.py` (run via `uv run`, PEP 723
   inline metadata declares `requires-python = ">=3.9"` and no deps).
 - Recognizes common prompt shapes: `user@host:~/path$`, bare `~/path$`, `/path>`.
-- Tunables (environment variables): `HERDR_FILELIST_INTERVAL` (default `1`s),
-  `HERDR_FILELIST_REMOTE_CACHE` (`3`s), `HERDR_FILELIST_SSH_TIMEOUT` (`5`s).
+- Tunables (environment variables): `HERDR_FILELIST_WIDTH` (sidebar width
+  fraction, default `0.3`; `0` disables self-sizing), `HERDR_FILELIST_INTERVAL`
+  (poll seconds, default `1`), `HERDR_FILELIST_REMOTE_CACHE` (`3`s),
+  `HERDR_FILELIST_SSH_TIMEOUT` (`5`s).
 
 `PLUGINS.md` is a field guide to the Herdr plugin model built around this plugin
 — manifest contract, injected environment, where pane cwd comes from, and the

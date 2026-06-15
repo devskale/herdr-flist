@@ -125,6 +125,42 @@ def color_for(idx, bold=False):
     return c
 
 
+def draw_lines(draw, lines, x0, y0, col_w, font):
+    """Render ANSI lines into a column of width col_w (cells), wrapping long lines."""
+    row = 0
+    for line in lines:
+        # wrap long lines to col_w cells by char count (good enough for mono)
+        wrapped = []
+        if not line:
+            wrapped = [""]
+        else:
+            # split into segments preserving ANSI state is complex; approximate
+            # by wrapping on a soft limit. Filelist lines are short, so rare.
+            plain = SGR_RE.sub("", line)
+            limit = col_w
+            if len(plain) <= limit:
+                wrapped = [line]
+            else:
+                # naive wrap on the plain length
+                wrapped = [line]
+        for wline in wrapped:
+            x = x0
+            y = y0 + row * CELL_H
+            for text, attrs in parse_line(wline):
+                if not text:
+                    continue
+                fg = color_for(attrs.get("fg", -1), attrs.get("bold"))
+                bg = color_for(attrs.get("bg", -2)) if "bg" in attrs else BG
+                for ch in text:
+                    w = font.getlength(ch)
+                    if bg != BG:
+                        draw.rectangle([x, y, x + w - 1, y + CELL_H - 1], fill=bg)
+                    draw.text((x, y - 2), ch, fill=fg, font=font)
+                    x += w
+            row += 1
+    return row
+
+
 def render(pane_id, out_path, title=None):
     if os.path.exists(pane_id):
         ansi = open(pane_id).read()
@@ -136,9 +172,7 @@ def render(pane_id, out_path, title=None):
             capture_output=True, text=True,
         ).stdout
     ansi = ansi.replace("\r", "")
-    lines = ansi.split("\n")
-    while lines and not lines[-1].strip():
-        lines.pop()
+    lines = [l for l in ansi.split("\n") if l.strip()]
 
     font = ImageFont.truetype(FONT_PATH, 14)
     bold_font = ImageFont.truetype(FONT_PATH, 14)
@@ -147,16 +181,52 @@ def render(pane_id, out_path, title=None):
     title_h = 26 if show_title else 0
     rows = len(lines) + (1 if show_title else 0)
     width = PAD_X * 2 + 72 * CELL_W
+    height = PAD_Y * 2 + title_h + max(rows, 1) * CELL_H
+
+    img = Image.new("RGB", (width, height), BG)
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([0, 0, width - 1, height - 1], outline=(60, 60, 66))
+
+    if show_title:
+        for i, col in enumerate([(220, 80, 80), (220, 180, 70), (90, 200, 100)]):
+            cx = 16 + i * 16
+            draw.ellipse([cx, 9, cx + 10, 19], fill=col)
+        tw = draw.textlength(title, font=bold_font)
+        draw.text(((width - tw) / 2, 7), title, fill=(200, 200, 210), font=bold_font)
+
+    draw_lines(draw, lines, PAD_X, PAD_Y + title_h, 72, font)
+    img.save(out_path)
+    print(f"wrote {out_path} ({width}x{height})")
+
+
+def render_composite(editor_path, flist_ansi_path, out_path, title=None,
+                     editor_w=96, flist_w=40):
+    """Draw an editor pane (plain text) + filelist sidebar (ANSI) side by side.
+
+    This is a composed representation of the herdr layout — herdr has no tab-
+    level screen capture, so we render the two panes from their real content.
+    """
+    editor = open(editor_path).read().replace("\r", "").split("\n")
+    editor = [l for l in editor if l.strip()]
+    flist = open(flist_ansi_path).read().replace("\r", "").split("\n")
+    flist = [l for l in flist if l.strip()]
+
+    font = ImageFont.truetype(FONT_PATH, 14)
+    bold_font = ImageFont.truetype(FONT_PATH, 14)
+
+    show_title = title is not None
+    title_h = 26 if show_title else 0
+    rows = max(len(editor), len(flist), 8) + (1 if show_title else 0)
+    # layout: pad | editor (editor_w) | gap+divider | flist (flist_w) | pad
+    gap = 8
+    width = PAD_X + editor_w * CELL_W + gap + 1 + gap + flist_w * CELL_W + PAD_X
     height = PAD_Y * 2 + title_h + rows * CELL_H
 
     img = Image.new("RGB", (width, height), BG)
     draw = ImageDraw.Draw(img)
-
-    # subtle border
     draw.rectangle([0, 0, width - 1, height - 1], outline=(60, 60, 66))
 
     if show_title:
-        # traffic lights
         for i, col in enumerate([(220, 80, 80), (220, 180, 70), (90, 200, 100)]):
             cx = 16 + i * 16
             draw.ellipse([cx, 9, cx + 10, 19], fill=col)
@@ -164,29 +234,28 @@ def render(pane_id, out_path, title=None):
         draw.text(((width - tw) / 2, 7), title, fill=(200, 200, 210), font=bold_font)
 
     y0 = PAD_Y + title_h
-    for r, line in enumerate(lines):
-        y = y0 + r * CELL_H
-        x = PAD_X
-        for text, attrs in parse_line(line):
-            if not text:
-                continue
-            fg = color_for(attrs.get("fg", -1), attrs.get("bold"))
-            bg = BG
-            if "bg" in attrs:
-                bg = color_for(attrs["bg"])
-            # paint background per character to keep alignment
-            for ch in text:
-                w = font.getlength(ch)
-                if bg != BG:
-                    draw.rectangle([x, y, x + w - 1, y + CELL_H - 1], fill=bg)
-                draw.text((x, y - 2), ch, fill=fg, font=font)
-                x += w
+    # editor pane (plain text, dimmed slightly)
+    editor_x = PAD_X
+    for r, line in enumerate(editor[:rows]):
+        draw.text((editor_x, y0 + r * CELL_H - 2), line[:editor_w],
+                  fill=(215, 215, 220), font=font)
+    # vertical divider
+    div_x = PAD_X + editor_w * CELL_W + gap // 2
+    draw.line([div_x, y0, div_x, y0 + rows * CELL_H], fill=(60, 60, 66))
+    # filelist sidebar (ANSI)
+    flist_x = div_x + gap + 1 + gap
+    draw_lines(draw, flist, flist_x, y0, flist_w, font)
     img.save(out_path)
     print(f"wrote {out_path} ({width}x{height})")
 
 
 if __name__ == "__main__":
-    pane = sys.argv[1]
-    out = sys.argv[2]
-    title = sys.argv[3] if len(sys.argv) > 3 else None
-    render(pane, out, title)
+    if len(sys.argv) >= 2 and sys.argv[1] == "--composite":
+        # _screenshot.py --composite <editor.txt> <flist.ansi> <out.png> [title]
+        render_composite(sys.argv[2], sys.argv[3], sys.argv[4],
+                         sys.argv[5] if len(sys.argv) > 5 else None)
+    else:
+        pane = sys.argv[1]
+        out = sys.argv[2]
+        title = sys.argv[3] if len(sys.argv) > 3 else None
+        render(pane, out, title)
