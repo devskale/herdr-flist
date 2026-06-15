@@ -174,7 +174,12 @@ def expand_remote_path(dest, path):
 
 
 def render_remote(dest, path):
-    """List `path` on `dest` over ssh. If path is None, list the login dir."""
+    """Return raw `ls -FA1` entries for `path` on `dest` over ssh.
+
+    Just the entries; the display path is already known to the caller (parsed
+    from the focused pane prompt), so no remote pwd is needed. If path is
+    None, list the remote login dir.
+    """
     key = (dest, path)
     now = time.time()
     cached = _remote_cache.get(key)
@@ -185,7 +190,7 @@ def render_remote(dest, path):
         full = expand_remote_path(dest, path)
         remote_cmd = "ls -FA1 --color=never -- " + shlex.quote(full)
     else:
-        remote_cmd = "pwd; printf '\\x1f'; ls -FA1 --color=never"
+        remote_cmd = "ls -FA1 --color=never"
 
     try:
         out = subprocess.run(
@@ -281,12 +286,11 @@ def render_local(cwd):
     return "\n".join(out)
 
 
-def format_remote_listing(body, dest):
-    if not body:
+def format_remote_listing(entries_text, dest):
+    if not entries_text:
         return f"{DIM}(ssh {dest}: no listing){R}"
-    rcwd, _, entries = body.partition("\x1f")
-    lines = [f"{BOLD}{rcwd}{R} ({dest})"]
-    for e in entries.splitlines():
+    lines = []
+    for e in entries_text.splitlines():
         if not e:
             continue
         if e.endswith("/"):
@@ -297,7 +301,7 @@ def format_remote_listing(body, dest):
             lines.append(f"{YELLOW}{e}{R}")
         else:
             lines.append(e)
-    return "\n".join(lines)
+    return "\n".join(lines) if lines else f"{DIM}(empty){R}"
 
 
 # --- main loop ------------------------------------------------------------
