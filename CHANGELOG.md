@@ -3,6 +3,41 @@
 All notable changes to herdr-flist. Versions follow the manifest `version` field
 in `herdr-plugin.toml`.
 
+## 0.3.0
+
+- **Interactive filelist** — the pane is now navigable, not just a display:
+  - Click an entry to select it (reverse-video bar); click the selected entry
+    again to open a `...` action menu (**Open in new pane**, **cd into followed
+    pane** for dirs, **Copy path**).
+  - Keyboard (ranger-style, while the pane is focused): focusing auto-selects
+    the first entry; **↑/↓** move the selection; **→** descends into a directory
+    or opens an **in-pane preview** of a file (filename as the title rule, file
+    content beneath; ↑/↓ scroll, ← or click goes back; binary files flagged);
+    **←** ascends to the parent directory. Browsing is local-only and resumes
+    following the focused pane when you focus another pane. Plain arrows are
+    forwarded by herdr only while the pane is focused.
+  - The pane enables SGR mouse reporting (`?1000h ?1006h`) and switches its PTY
+    to non-canonical mode — a click carries no newline, so cooked mode would
+    buffer it forever; this makes clicks and keypresses arrive per-read.
+- Symlinked directories (`ln -s` to a dir) are recognized as enterable — `ls -F`
+  marks them `@`, not `/`, so they're now resolved and `→` descends into them.
+
+- **Update gating:** the listing only refreshes while its pane is on screen
+  (it shares the focused pane's tab). Background tabs pause the polling work —
+  no `process-info` / `ls` / `git` / `ssh` calls — and refresh immediately when
+  you return to the tab.
+- **Click-stable:** focusing the filelist pane itself no longer makes the view
+  jump to the plugin root. Self-focus is now detected by pane-id equality
+  (`focused.pane_id == HERDR_PANE_ID`) instead of matching the script name in
+  the foreground argv, which was unreliable and could miss at click time.
+- **Visual overhaul:** the view is laid out to the pane's own size (read from
+  its PTY, no herdr call): a title rule with a `~`-abbreviated, left-truncated
+  path; a dirs-first listing (now actually sorted, not raw `ls` order) with a
+  2-cell git status gutter (`M A D R ? !`); width-aware ellipsization that
+  preserves type indicators; and a footer with the item count and git
+  branch/ahead-behind. Modified files now show a marker — the old renderer
+  silently dropped them.
+
 ## 0.1.2
 
 - Docs: sync README and PLUGINS.md to the current behavior (right sidebar,

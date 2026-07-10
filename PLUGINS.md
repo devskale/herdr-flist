@@ -280,14 +280,17 @@ herdr-flist/
   LICENSE             # MIT
 ```
 
-### What `filelist.py` does, per tick (1 s)
+### What `filelist.py` does, per tick (1 s) — but only while its pane is
+visible (on the focused pane's tab); a background tab skips the expensive
+steps and refreshes immediately on return:
 
 1. `focused_pane()` — `herdr pane list` -> JSON -> the focused pane's id + record.
 2. `fg_info()` — `herdr pane process-info --pane <id>` -> foreground
    `name`, joined `argv`, and OS `cwd` (fallback for local).
-3. **Self-detection:** if the focused pane's argv contains the script's own
-   basename (`filelist.py`), the filelist pane *itself* is focused — keep showing
-   the last real pane instead of the plugin root.
+3. **Self-detection:** if the focused pane *is* this pane — detected by
+   pane-id equality (`focused.pane_id == HERDR_PANE_ID`), with the script
+   basename in the foreground argv as a fallback — keep showing the last real
+   pane instead of the plugin root.
 4. **SSH detection:** if the foreground is `ssh`/`mosh`, parse the destination,
    recover the remote cwd from the focused pane's prompt (§5), and render over
    ssh (cached).
@@ -429,8 +432,10 @@ reinstall.
    Herdr's normal Windows launcher and must be valid Windows argv.
 
 7. **Self-focus feedback.** When the user focuses the plugin pane itself, naive
-   "follow focused" logic chases its own cwd. Detect self (e.g. by the script
-   basename in the foreground argv) and pin to the last real pane.
+   "follow focused" logic chases its own cwd. Detect self by **pane-id equality**
+   (`focused.pane_id == HERDR_PANE_ID`, injected by herdr) — not by matching the
+   script name in the foreground argv, which is unreliable at click time — and
+   pin to the last real pane.
 
 8. **Don't `unwrap()` / don't add deps casually / platform code stays isolated**
    — these are Herdr's own conventions (`AGENTS.md`) and apply if you ever patch

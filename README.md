@@ -41,12 +41,28 @@ than a 50/50 split:
 herdr plugin action invoke open --plugin herdr-flist
 ```
 
-- Local panes: the cwd comes from Herdr (OSC 7). Entries are dirs-first,
-  colorized by type, and tagged with git status (`+new` `-del` `~ren`
-  `?untracked` `!conflict`).
+- Local panes: the cwd comes from Herdr (OSC 7). Entries are sorted
+  dirs-first, colorized by type, and tagged with a git status gutter
+  (`M` `A` `D` `R` `?` `!`). The view is laid out to the pane's own size — a
+  title rule with the `~`-abbreviated path, a width-fit listing, and a footer
+  with the item count and git branch.
 - SSH panes: Herdr drops remote-host cwd reporting, so the remote cwd is parsed
   from the focused pane's own shell prompt and listed over `ssh`. This is what
   lets the view follow the remote shell into subdirectories.
+- Update gating: the listing only refreshes while its pane is on screen (the
+  focused pane's tab); a background tab pauses and refreshes the moment you
+  return. Clicking the filelist pane itself doesn't change the view — it holds
+  the last followed directory instead of jumping to its own.
+- Interaction: click an entry to select it (reverse-video bar); click the
+  selected entry again for a `...` action menu (Open in new pane / cd into the
+  followed pane / Copy path). With the pane focused it's ranger-like: focusing
+  auto-selects the first entry; ↑/↓ move the selection; → descends into a
+  directory or opens an **in-pane preview** of a file (filename as the title,
+  content beneath; ↑/↓ scroll, ← or click goes back); ← ascends to the parent
+  directory. Browsing is local-only and resumes following when you focus
+  another pane. The pane enables SGR mouse reporting, so — as in any terminal
+  multiplexer — the first click on an unfocused filelist only focuses it;
+  subsequent clicks select.
 
 The pane is a normal Herdr pane after creation. The plugin does not clean it up
 or manage its lifecycle.

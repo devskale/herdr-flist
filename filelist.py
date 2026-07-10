@@ -11,8 +11,11 @@ A live file listing that follows the focused pane's working directory.
                  reliable window into the interactive session's cwd). We then
                  `ssh dest 'ls <that path>'`.
 
-Long-running: owns its pane, redraws only when the view changes. See
-PLUGINS.md.
+The view is laid out to the pane's own size (read from its PTY — no herdr
+call): a title rule, a dirs-first listing with a git status gutter, and a
+footer status line. It only refreshes while on screen and holds its view when
+focused itself. Click an entry to select it (reverse-video bar); click the
+selected entry again to open a `...` action menu. See PLUGINS.md.
 """
 # /// script
 # requires-python = ">=3.9"
@@ -24,9 +27,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import select
 import shlex
+import shutil
 import subprocess
 import sys
+import termios
 import time
 
 HERDR = os.environ.get("HERDR_BIN_PATH", "herdr")
@@ -36,12 +42,18 @@ SSH_TIMEOUT = float(os.environ.get("HERDR_FILELIST_SSH_TIMEOUT", "5"))
 # On startup, narrow this pane toward this fraction of its parent region so it
 # reads as a sidebar column instead of a 50/50 split. 0 disables self-sizing.
 SIDEBAR_FRACTION = float(os.environ.get("HERDR_FILELIST_WIDTH", "0.3"))
+# Command used by the "Open in new pane" action on a file (default: $EDITOR, vi).
+OPENER = os.environ.get("HERDR_FILELIST_OPENER") or os.environ.get("EDITOR") or "vi"
 SELF_TOKEN = os.path.basename(__file__)  # for "this pane is me" detection
+ME_ID = os.environ.get("HERDR_PANE_ID", "")  # this pane's own id (visibility gating)
+
+_SHELLS = {"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "csh", "ash", "nu"}
 
 # --- ANSI -----------------------------------------------------------------
 R = "\033[0m"
 DIM = "\033[2m"
 BOLD = "\033[1m"
+REV = "\033[7m"
 BLUE = "\033[34m"
 GREEN = "\033[32m"
 CYAN = "\033[36m"
@@ -50,19 +62,21 @@ RED = "\033[31m"
 MAGENTA = "\033[35m"
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-_ANSI_ALL_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
-# Prompt shapes we try to pull a cwd out of. The path must start with `/` or
-# `~` (i.e. `\w`-style), which keeps false positives low.
 PROMPT_PATTERNS = [
-    # user@host:~/path$  /  user@host:/path#   (the overwhelmingly common form)
     re.compile(r"\S+@\S+:([~/][^\$#]*?)\s*[$#]\s*$"),
-    # bare ~/path$  /  /path>  /  /path%       (custom / minimal prompts)
     re.compile(r"([~/][^\$#>%]*?)\s*[$#>%]\s*$"),
 ]
 
 SSH_RE = re.compile(r"(^|\s)(ssh|mosh)(\s|$)")
 SSH_VALUE_OPTS = set("ilopFEJLRDWwbcm".split())
+
+_INDICATORS = "/@=*|%>"  # trailing `ls -F` type indicators
+
+# SGR mouse event: ESC [< button ; x ; y M(press)/m(release). x,y are 1-based.
+MOUSE_RE = re.compile(rb"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
+# Arrow keys, normal (ESC [ A) and application-cursor (ESC O A) forms.
+KEY_RE = re.compile(rb"\x1b(?:\[|O)[ABCD]")
 
 # --- herdr CLI helpers -----------------------------------------------------
 def herdr_json(args: list[str]):
@@ -75,14 +89,16 @@ def herdr_json(args: list[str]):
         return None
 
 
-def focused_pane():
+def pane_entries():
+    """All panes from `pane list` (empty list on failure)."""
     d = herdr_json(["pane", "list"])
     if not isinstance(d, dict):
-        return None, None
-    for p in d.get("result", {}).get("panes", []):
-        if p.get("focused"):
-            return p.get("pane_id"), p
-    return None, None
+        return []
+    return d.get("result", {}).get("panes", []) or []
+
+
+def find_focused(panes):
+    return next((p for p in panes if p.get("focused")), None)
 
 
 def fg_info(pane_id):
@@ -102,16 +118,13 @@ def fg_info(pane_id):
     return p.get("name", ""), " ".join(argv), p.get("cwd")
 
 
+def is_shell(name: str) -> bool:
+    return name in _SHELLS
+
+
 # --- self-sizing into a sidebar column -------------------------------
 def narrow_self():
-    """Shrink this pane toward SIDEBAR_FRACTION of its parent region.
-
-    A fresh right split is 50/50, too wide for a file list. We read the live
-    layout, compute the fraction delta, and issue one `pane resize` whose
-    amount is that delta (verified empirically: a right-resize of amount D
-    drops the pane's width fraction by ~D). No-op if already narrow enough or
-    if HERDR_PANE_ID is unset.
-    """
+    """Shrink this pane toward SIDEBAR_FRACTION of its parent region."""
     if not (0 < SIDEBAR_FRACTION < 0.5):
         return
     pane_id = os.environ.get("HERDR_PANE_ID", "")
@@ -160,7 +173,6 @@ def ssh_dest(argv_str: str):
                 dest = toks[i + 1]
             break
         if t.startswith("-") and not t.startswith("---"):
-            # skip the argument of options that take a value (-p 22, -i key, ...)
             if len(t) == 2 and t[1] in SSH_VALUE_OPTS:
                 i += 2
                 continue
@@ -217,12 +229,7 @@ def expand_remote_path(dest, path):
 
 
 def render_remote(dest, path):
-    """Return raw `ls -FA1` entries for `path` on `dest` over ssh.
-
-    Just the entries; the display path is already known to the caller (parsed
-    from the focused pane prompt), so no remote pwd is needed. If path is
-    None, list the remote login dir.
-    """
+    """Return raw `ls -FA1` entries for `path` on `dest` over ssh."""
     key = (dest, path)
     now = time.time()
     cached = _remote_cache.get(key)
@@ -247,22 +254,136 @@ def render_remote(dest, path):
     return out
 
 
-# --- local listing --------------------------------------------------------
-def git_status_map(cwd):
+# --- terminal size & text helpers ----------------------------------------
+def pane_size():
+    """This pane's (cols, rows) from its own PTY. No herdr call needed."""
+    try:
+        sz = shutil.get_terminal_size((80, 24))
+        return sz.columns, sz.lines
+    except Exception:
+        return 80, 24
+
+
+def ellipsize(s, width):
+    if width <= 0:
+        return ""
+    if len(s) <= width:
+        return s
+    if width == 1:
+        return "…"
+    return s[: width - 1] + "…"
+
+
+def ellipsize_left(s, width):
+    if width <= 0:
+        return ""
+    if len(s) <= width:
+        return s
+    if width == 1:
+        return "…"
+    return "…" + s[-(width - 1):]
+
+
+def shorten_path(path, width):
+    home = os.path.expanduser("~")
+    if home and path == home:
+        s = "~"
+    elif home and path.startswith(home + os.sep):
+        s = "~" + path[len(home):]
+    else:
+        s = path
+    return ellipsize_left(s, width)
+
+
+def _split_indicator(entry):
+    for c in ("/", "@", "*", "|", "="):
+        if entry.endswith(c):
+            return entry[:-1], c
+    return entry, ""
+
+
+def fit_entry(entry, maxw):
+    """Ellipsize an `ls -F` token, keeping its trailing type indicator."""
+    if len(entry) <= maxw:
+        return entry
+    core, ind = _split_indicator(entry)
+    avail = maxw - len(ind)
+    if avail <= 1:
+        return ellipsize(entry, maxw)
+    return ellipsize(core, avail) + ind
+
+
+# --- coloring -------------------------------------------------------------
+def style_name(entry):
+    if entry.endswith("/"):
+        return f"{BLUE}{BOLD}{entry}{R}"
+    if entry.endswith("@"):
+        return f"{CYAN}{entry}{R}"
+    if entry.endswith("|"):
+        return f"{YELLOW}{entry}{R}"
+    if entry.endswith("="):
+        return f"{MAGENTA}{entry}{R}"
+    if entry.endswith("*"):
+        return f"{GREEN}{entry[:-1]}{R}"
+    return entry
+
+
+def git_gutter(code):
+    if code == "M":
+        return f"{YELLOW}M{R} "
+    if code == "A":
+        return f"{GREEN}A{R} "
+    if code == "D":
+        return f"{RED}D{R} "
+    if code == "R":
+        return f"{YELLOW}R{R} "
+    if code == "?":
+        return f"{DIM}?{R} "
+    if code == "U":
+        return f"{RED}!{R} "
+    return "  "
+
+
+def git_info(cwd):
+    """Return (status_map, branch_label) for cwd; ({}, None) if not a repo."""
     try:
         if subprocess.run(
             ["git", "-C", cwd, "rev-parse", "--is-inside-work-tree"],
             capture_output=True,
         ).returncode != 0:
-            return {}
+            return {}, None
         st = subprocess.run(
-            ["git", "-C", cwd, "status", "--porcelain=v1"],
+            ["git", "-C", cwd, "status", "--porcelain=v1", "-b"],
             capture_output=True, text=True,
         ).stdout
     except Exception:
-        return {}
-    m = {}
-    for line in st.splitlines():
+        return {}, None
+    lines = st.splitlines()
+    branch = None
+    start = 0
+    if lines and lines[0].startswith("## "):
+        start = 1
+        hdr = lines[0][3:]
+        ahead = behind = ""
+        m = re.search(r"\[([^\]]*)\]", hdr)
+        if m:
+            inside = m.group(1)
+            ah = re.search(r"ahead\s+(\d+)", inside)
+            bd = re.search(r"behind\s+(\d+)", inside)
+            if ah:
+                ahead = f" ↑{ah.group(1)}"
+            if bd:
+                behind = f" ↓{bd.group(1)}"
+        if "no branch" in hdr.lower():
+            name = "DETACHED"
+        elif hdr.startswith("No commits yet on ") or hdr.startswith("Initial commit on "):
+            name = hdr.split(" on ")[-1].strip()
+        else:
+            name = hdr.split("...")[0].split(" ")[0]
+        if name:
+            branch = f"{name}{ahead}{behind}"
+    gmap = {}
+    for line in lines[start:]:
         if len(line) < 4:
             continue
         code, f = line[:2], line[3:].strip()
@@ -277,103 +398,419 @@ def git_status_map(cwd):
             tag = "?"
         elif "U" in code:
             tag = "U"
-        m[f.split(" -> ")[0]] = tag
-    return m
+        gmap[f.split(" -> ")[0]] = tag
+    return gmap, branch
 
 
-def render_local(cwd):
-    if not os.path.isdir(cwd):
-        return f"{DIM}(not a directory: {cwd}){R}"
-    gmap = git_status_map(cwd)
-    try:
-        listing = subprocess.run(
-            ["ls", "-FA1", "--color=never"], cwd=cwd,
-            capture_output=True, text=True,
-        ).stdout
-    except Exception:
-        return f"{DIM}(cannot list {cwd}){R}"
+# --- entry rendering ------------------------------------------------------
+def _sort_key(entry):
+    name = entry.rstrip(_INDICATORS).lower()
+    return (0 if entry.endswith("/") else 1, name)
 
+
+def render_entries(raw, gmap, width, cwd=None):
+    """Turn raw `ls -FA1` output into dirs-first entry records.
+
+    A symlink (`@`) that resolves to a directory (local `cwd` only) is treated
+    as a directory so → can descend into it; `ls -F` marks such entries with
+    `@`, not `/`.
+    """
+    max_name = max(1, width - 2)
     out = []
-    for entry in listing.splitlines():
-        if not entry:
-            continue
-        if entry.endswith("/"):
-            tag = f"{BLUE}{BOLD}{entry}{R}"
-        elif entry.endswith("|"):
-            tag = f"{YELLOW}{entry}{R}"
-        elif entry.endswith("="):
-            tag = f"{MAGENTA}{entry}{R}"
-        elif entry.endswith("@"):
-            tag = f"{CYAN}{entry}{R}"
-        else:
-            full = os.path.join(cwd, entry)
-            tag = f"{GREEN}{entry}{R}" if os.access(full, os.X_OK) else entry
-        base = entry.rstrip("/@=*|")
-        code = gmap.get(base)
-        # also flag if a modified entry lives under this directory
-        if code is None:
-            code = next(
-                (v for k, v in gmap.items() if k.startswith(base + "/")), None
+    for entry in sorted((e for e in raw.splitlines() if e), key=_sort_key):
+        base = entry.rstrip(_INDICATORS)
+        code = None
+        if gmap:
+            code = gmap.get(base)
+            if code is None:
+                code = next(
+                    (v for k, v in gmap.items() if k.startswith(base + "/")), None
+                )
+        token = fit_entry(entry, max_name)
+        is_dir = entry.endswith("/")
+        if not is_dir and cwd and entry.endswith("@"):
+            try:
+                is_dir = os.path.isdir(os.path.join(cwd, base))
+            except Exception:
+                pass
+        out.append({
+            "line": git_gutter(code) + style_name(token),
+            "token": token,
+            "name": base,
+            "dir": is_dir,
+        })
+    return out
+
+
+def _msg(text):
+    return [{"line": f"{DIM}{text}{R}", "token": text, "name": "", "dir": False}]
+
+
+def _bar(token, cols, hint=True):
+    """Full-width reverse-video selection bar. `hint` shows a `...` affordance."""
+    if hint:
+        tok = fit_entry(token, max(1, cols - 5))
+        body = "  " + tok
+        pad = max(0, cols - len(body) - 3)
+        return f"{REV}{body}{' ' * pad}...{R}"
+    tok = fit_entry(token, max(1, cols - 2))
+    body = "  " + tok
+    pad = max(0, cols - len(body))
+    return f"{REV}{body}{' ' * pad}{R}"
+
+
+def _row_line(rec, cols, selected_name, hint):
+    if selected_name and rec["name"] == selected_name:
+        return _bar(rec["token"], cols, hint)
+    return rec["line"]
+
+
+def entry_at_row(entries, rows, r, menu_open=False, k=0):
+    """Base name of the selectable entry at 1-based pane row `r`, else None."""
+    if r < 2 or rows < 3:
+        return None
+    entry_rows = max(0, rows - 2 - (k + 1 if menu_open else 0))
+    more = len(entries) > entry_rows
+    show_count = (entry_rows - 1) if more else entry_rows
+    show_count = max(0, min(show_count, len(entries)))
+    idx = r - 2
+    if 0 <= idx < show_count:
+        return entries[idx]["name"]
+    return None
+
+
+def menu_action_at_row(rows, k, r):
+    """Index (0-based) of the menu action at 1-based row `r`, else None.
+
+    Menu layout: rule at `rows-k-1`, actions at `rows-k .. rows-1`, footer `rows`.
+    """
+    first = rows - k
+    idx = r - first
+    if 0 <= idx < k:
+        return idx
+    return None
+
+
+# --- screen composition ---------------------------------------------------
+def title_rule(path, width):
+    s = shorten_path(path, max(1, width - 2))
+    label = f" {s} "
+    fill = max(0, width - len(label))
+    return f"{BOLD}{CYAN}{label}{R}{DIM}{'─' * fill}{R}"
+
+
+def footer(width, n_items, branch):
+    count = f"{n_items} {'items' if n_items != 1 else 'item'}"
+    plain = [count]
+    shown = [f"{DIM}{count}{R}"]
+    if branch:
+        plain.append(branch)
+        shown.append(f"{CYAN}{branch}{R}")
+    sep = "  "
+    text = sep.join(plain)
+    if len(text) > width:
+        return f"{DIM}{ellipsize(text, width)}{R}"
+    pad = max(0, width - len(text))
+    return sep.join(shown) + " " * pad
+
+
+def _menu_lines(title, labels, cols):
+    label = f" actions · {title} "
+    fill = max(0, cols - len(label))
+    out = [f"{MAGENTA}{label}{R}{DIM}{'─' * fill}{R}"]
+    for i, lab in enumerate(labels, 1):
+        plain = f" {i}  {lab}"
+        lab2 = lab if len(plain) <= cols else ellipsize(lab, max(1, cols - 4))
+        out.append(f" {BOLD}{CYAN}{i}{R}  {lab2}")
+    return out
+
+
+def compose(title_path, entries, branch, cols, rows,
+            selected_name=None, hint=True, menu=None):
+    """Assemble a full `rows`-line screen: title rule, entries, (menu), footer."""
+    if rows <= 0:
+        return ""
+    if rows == 1:
+        return ellipsize(title_path, cols)
+    title = title_rule(title_path, cols)
+    if rows == 2:
+        return title + "\n" + footer(cols, len(entries), branch)
+    labels = menu["labels"] if menu else []
+    k = len(labels)
+    entry_rows = max(0, rows - 2 - (k + 1 if menu else 0))
+    more = len(entries) > entry_rows
+    show_count = (entry_rows - 1) if (more and entry_rows >= 1) else entry_rows
+    show_count = max(0, min(show_count, len(entries)))
+    body = [_row_line(entries[i], cols, selected_name, hint) for i in range(show_count)]
+    if more and entry_rows >= 1:
+        body.append(f"{DIM}{ellipsize(f'+{len(entries) - entry_rows} more not shown', cols)}{R}")
+    lines = [title] + body
+    region = (rows - k - 2) if menu else (rows - 1)
+    while len(lines) < region:
+        lines.append("")
+    if menu:
+        lines += _menu_lines(menu["title"], labels, cols)
+    lines.append(footer(cols, len(entries), branch))
+    return "\n".join(lines[:rows])
+
+
+def preview_footer(width, offset, avail, total, is_bin):
+    if is_bin:
+        info = "binary"
+    elif total == 0:
+        info = "(empty)"
+    else:
+        info = f"{min(offset + 1, total)}-{min(offset + avail, total)}/{total}"
+    text = "preview  " + info
+    if len(text) > width:
+        text = ellipsize(text, width)
+    return f"{DIM}{text}{' ' * max(0, width - len(text))}{R}"
+
+
+def compose_preview(filename, lines, offset, cols, rows):
+    """Title rule = filename; body = a slice of the file; footer = position."""
+    if rows <= 0:
+        return ""
+    if rows == 1:
+        return ellipsize(filename, cols)
+    title = title_rule(filename, cols)
+    avail = rows - 2
+    total = len(lines) if lines else 0
+    if lines is None:
+        body = [f"{DIM}(binary or unreadable){R}"]
+    else:
+        body = [ellipsize(ln, cols) for ln in lines[offset:offset + avail]]
+    while len(body) < avail:
+        body.append("")
+    out = [title] + body
+    out.append(preview_footer(cols, offset, avail, total, lines is None))
+    return "\n".join(out[:rows])
+
+
+# --- menu actions ---------------------------------------------------------
+def _extract_pane_id(obj):
+    if isinstance(obj, dict):
+        if "pane_id" in obj:
+            return obj["pane_id"]
+        for v in obj.values():
+            r = _extract_pane_id(v)
+            if r:
+                return r
+    return None
+
+
+def copy_to_clipboard(text: str) -> bool:
+    for cmd in (["pbcopy"], ["wl-copy"], ["xclip", "-selection", "clipboard"],
+                ["xsel", "--clipboard", "--input"]):
+        try:
+            if shutil.which(cmd[0]):
+                subprocess.run(cmd, input=text.encode(), capture_output=True)
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def build_actions(abspath, is_dir, followed_pid, followed_is_shell):
+    """Action list for the menu. `src` is the pane a new split attaches to."""
+    src = followed_pid or ME_ID
+    acts = []
+    if is_dir:
+        acts.append({"label": "Open in new pane", "op": "open_pane",
+                     "path": abspath, "is_dir": True, "src": src})
+        if followed_is_shell:
+            acts.append({"label": "cd into followed pane", "op": "cd_into",
+                         "path": abspath, "pid": followed_pid})
+    else:
+        acts.append({"label": f"Open in new pane ({OPENER.split()[0]})", "op": "open_pane",
+                     "path": abspath, "is_dir": False, "src": src})
+    acts.append({"label": "Copy path", "op": "copy", "path": abspath})
+    return acts
+
+
+def build_menu(kind, cwd, name, entries, followed_pid):
+    """Return {title, actions} for an entry, or None if no actions apply."""
+    if kind != "local" or not cwd:
+        return None
+    rec = next((e for e in entries if e["name"] == name), None)
+    if not rec:
+        return None
+    base = rec["token"].rstrip(_INDICATORS)
+    abspath = os.path.join(cwd, base)
+    fshell = is_shell(fg_info(followed_pid)[0]) if followed_pid else False
+    return {
+        "title": base + ("/" if rec["dir"] else ""),
+        "actions": build_actions(abspath, rec["dir"], followed_pid, fshell),
+    }
+
+
+def run_action(act):
+    """Execute a menu action. Failures are swallowed (best-effort)."""
+    try:
+        op = act.get("op")
+        if op == "copy":
+            copy_to_clipboard(act["path"])
+        elif op == "cd_into":
+            subprocess.run(
+                [HERDR, "pane", "run", act["pid"], "cd " + shlex.quote(act["path"])],
+                capture_output=True,
             )
-        if code == "A":
-            tag += f" {GREEN}(+new){R}"
-        elif code == "D":
-            tag += f" {RED}(-del){R}"
-        elif code == "R":
-            tag += f" {YELLOW}(~ren){R}"
-        elif code == "?":
-            tag += f" {DIM}(?untracked){R}"
-        elif code == "U":
-            tag += f" {RED}(!conflict){R}"
-        out.append(tag)
-    return "\n".join(out)
+        elif op == "open_pane":
+            target_cwd = act["path"] if act["is_dir"] else (os.path.dirname(act["path"]) or ".")
+            r = subprocess.run(
+                [HERDR, "pane", "split", "--pane", act["src"], "--direction", "down",
+                 "--cwd", target_cwd, "--no-focus"],
+                capture_output=True, text=True,
+            )
+            new_id = None
+            try:
+                new_id = _extract_pane_id(json.loads(r.stdout))
+            except Exception:
+                pass
+            if not act["is_dir"] and new_id:
+                subprocess.run(
+                    [HERDR, "pane", "run", new_id,
+                     f"{OPENER} {shlex.quote(os.path.basename(act['path']))}"],
+                    capture_output=True,
+                )
+    except Exception:
+        pass
 
 
-def format_remote_listing(entries_text, dest):
-    if not entries_text:
-        return f"{DIM}(ssh {dest}: no listing){R}"
-    lines = []
-    for e in entries_text.splitlines():
-        if not e:
-            continue
-        if e.endswith("/"):
-            lines.append(f"{BLUE}{BOLD}{e}{R}")
-        elif e.endswith("@"):
-            lines.append(f"{CYAN}{e}{R}")
-        elif e.endswith("|"):
-            lines.append(f"{YELLOW}{e}{R}")
-        else:
-            lines.append(e)
-    return "\n".join(lines) if lines else f"{DIM}(empty){R}"
+_preview_cache: dict[str, tuple[float, list[str] | None]] = {}
+
+
+def read_text_file(path, max_lines=20000):
+    """Return text lines of a file, or None if it is binary / unreadable."""
+    try:
+        with open(path, "rb") as f:
+            if b"\x00" in f.read(2048):
+                return None
+        lines = []
+        with open(path, "r", errors="replace") as f:
+            for _ in range(max_lines):
+                ln = f.readline()
+                if not ln:
+                    break
+                lines.append(ln.rstrip("\n").replace("\t", "    "))
+        return lines
+    except Exception:
+        return None
+
+
+def get_preview_lines(path):
+    """Cached text lines for `path`, keyed on mtime."""
+    try:
+        mtime = os.path.getmtime(path)
+    except Exception:
+        return None
+    cached = _preview_cache.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    lines = read_text_file(path)
+    _preview_cache[path] = (mtime, lines)
+    return lines
 
 
 # --- main loop ------------------------------------------------------------
 def main():
     last = {"pid": None, "cwd": None, "kind": None, "ssh": None}
     last_render = ""
+    stale = True
+    selected_name: str | None = None
+    selected_path: str | None = None
+    preview: str | None = None        # abspath being previewed (in-pane viewer)
+    preview_offset = 0
+    browse_cwd: str | None = None     # when self-focused + local, overrides the followed cwd
+    menu_open = False
+    menu_actions: list = []
+    menu_title = ""
+    inbuf = b""
 
     narrow_self()
-    sys.stdout.write("\033[?25l")  # hide cursor
+    # hide cursor, disable line wrap, enable SGR mouse reporting (press/release)
+    sys.stdout.write("\033[?25l\033[?7l\033[?1000h\033[?1006h")
     sys.stdout.flush()
 
+    try:
+        stdin_fd = sys.stdin.buffer.fileno()
+    except Exception:
+        stdin_fd = -1
+
+    # Put the PTY into non-canonical mode so mouse/keypress bytes arrive
+    # per-read instead of being line-buffered: a mouse click carries no
+    # newline, so cooked mode would hold it forever and we'd never see it.
+    # OPOST is left ON so our "\n" still maps to CRLF on the screen.
+    saved_tc = None
+    if stdin_fd >= 0:
+        try:
+            saved_tc = termios.tcgetattr(stdin_fd)
+            tc = termios.tcgetattr(stdin_fd)
+            tc[3] = tc[3] & ~termios.ICANON & ~termios.ECHO  # lflag
+            tc[6][termios.VMIN] = 0
+            tc[6][termios.VTIME] = 0
+            termios.tcsetattr(stdin_fd, termios.TCSANOW, tc)
+        except Exception:
+            saved_tc = None
+
     def restore():
-        sys.stdout.write("\033[?25h")
+        if saved_tc is not None:
+            try:
+                termios.tcsetattr(stdin_fd, termios.TCSANOW, saved_tc)
+            except Exception:
+                pass
+        sys.stdout.write("\033[?1006l\033[?1000l\033[?7h\033[?25h")
         sys.stdout.flush()
+
+    def move(delta):
+        """Move the selection by `delta` entries (clamped)."""
+        nonlocal selected_name, stale
+        names = [e["name"] for e in entries if e["name"]]
+        if not names:
+            return
+        cur = names.index(selected_name) if selected_name in names else None
+        cur = 0 if cur is None else max(0, min(len(names) - 1, cur + delta))
+        selected_name = names[cur]
+        stale = True
 
     try:
         while True:
-            pid, pane = focused_pane()
+            panes = pane_entries()
+            focused = find_focused(panes)
+
+            me = (
+                next((p for p in panes if p.get("pane_id") == ME_ID), None)
+                if ME_ID
+                else None
+            )
+            visible = (
+                bool(me and focused and me.get("tab_id") == focused.get("tab_id"))
+                if ME_ID
+                else True
+            )
+            if not visible:
+                stale = True
+                time.sleep(INTERVAL)
+                continue
+
+            pane = focused
+            pid = pane.get("pane_id") if pane else None
             name, argv, proc_cwd = fg_info(pid)
             osc_cwd = pane.get("cwd") if pane else None
 
+            self_focused = bool(ME_ID and pid == ME_ID) or (SELF_TOKEN in argv)
+            if not self_focused:
+                browse_cwd = None  # leaving the sidebar resumes following
+
             kind = cwd = ssh_target = None
 
-            if SELF_TOKEN in argv:
-                # the filelist pane itself is focused: hold the last real view
+            if self_focused:
+                # the filelist pane itself is focused: hold the last real view,
+                # or the directory we browsed into (local only).
                 pid = last["pid"]
-                cwd = last["cwd"]
                 kind = last["kind"]
                 ssh_target = last.get("ssh")
+                cwd = browse_cwd if (browse_cwd and kind == "local") else last["cwd"]
             elif SSH_RE.search(name + " " + argv):
                 dest = ssh_dest(argv)
                 if dest:
@@ -385,31 +822,154 @@ def main():
                 elif proc_cwd:
                     kind, cwd = "local", proc_cwd
 
-            header = body = ""
+            cols, rows = pane_size()
+            title_path = cwd or "(no cwd)"
+            entries: list = []
+            branch = None
+
             if kind == "local" and cwd:
-                header, body = cwd, render_local(cwd)
+                if not os.path.isdir(cwd):
+                    entries = _msg("(not a directory)")
+                else:
+                    gmap, branch = git_info(cwd)
+                    try:
+                        raw = subprocess.run(
+                            ["ls", "-FA1", "--color=never"], cwd=cwd,
+                            capture_output=True, text=True,
+                        ).stdout
+                    except Exception:
+                        raw = ""
+                    entries = render_entries(raw, gmap, cols, cwd) or _msg("(empty)")
             elif kind == "ssh" and ssh_target:
                 rpath = remote_cwd_from_pane(pid) if pid else None
-                if rpath:
-                    header = f"{ssh_target}:{rpath}"
-                    body = format_remote_listing(render_remote(ssh_target, rpath), ssh_target)
-                else:
-                    header = f"ssh {ssh_target} (home)"
-                    body = format_remote_listing(render_remote(ssh_target, None), ssh_target)
+                title_path = f"{ssh_target}:{rpath}" if rpath else f"{ssh_target}:~"
+                raw = render_remote(ssh_target, rpath)
+                entries = render_entries(raw, {}, cols) or _msg("(no listing)")
             else:
-                header = "(no cwd reported)"
-                body = "focus a pane that has reported a working directory."
+                entries = _msg("focus a pane with a working directory")
+
+            # selection + menu are only valid for the current view
+            if selected_path != title_path:
+                selected_name = None
+                selected_path = title_path
+                menu_open = False
+                preview = None
+                preview_offset = 0
+
+            # when this pane is focused, ensure there's a selection to navigate
+            if self_focused and not selected_name and entries and entries[0]["name"]:
+                selected_name = entries[0]["name"]
+                stale = True
 
             if pid and kind:
                 last = {"pid": pid, "cwd": cwd, "kind": kind, "ssh": ssh_target}
 
-            render = f"{BOLD}{header}{R}\n{body}"
-            if render != last_render:
-                last_render = render
-                sys.stdout.write("\033[H\033[2J" + render + "\n")
+            k = len(menu_actions) if menu_open else 0
+            menu = ({"title": menu_title, "labels": [a["label"] for a in menu_actions]}
+                    if menu_open else None)
+            hint = kind == "local"
+            if preview:
+                plines = get_preview_lines(preview) if kind == "local" else None
+                total = len(plines) if plines else 0
+                if preview_offset > total:
+                    preview_offset = max(0, total - 1)
+                screen = compose_preview(os.path.basename(preview), plines,
+                                         preview_offset, cols, rows)
+            else:
+                screen = compose(title_path, entries, branch, cols, rows,
+                                 selected_name, hint, menu)
+            if stale or screen != last_render:
+                stale = False
+                last_render = screen
+                sys.stdout.write("\033[2J\033[H" + screen)
                 sys.stdout.flush()
 
-            time.sleep(INTERVAL)
+            # wait for either the next poll tick or a mouse click on stdin
+            rdy = select.select([stdin_fd], [], [], INTERVAL)[0] if stdin_fd >= 0 else []
+            if rdy:
+                try:
+                    chunk = os.read(stdin_fd, 4096)
+                except OSError:
+                    chunk = b""
+                if chunk:
+                    inbuf += chunk
+                    end = 0
+                    for m in MOUSE_RE.finditer(inbuf):
+                        end = m.end()
+                        if m.group(4) != b"M":  # button press only
+                            continue
+                        button = int(m.group(1)) & 3
+                        y = int(m.group(3))
+                        if button != 0:  # left click only
+                            continue
+                        if preview:  # any click exits the in-pane preview
+                            preview = None
+                            preview_offset = 0
+                            stale = True
+                            continue
+                        if menu_open:
+                            idx = menu_action_at_row(rows, len(menu_actions), y)
+                            if idx is not None:
+                                run_action(menu_actions[idx])
+                            menu_open = False
+                            stale = True
+                        else:
+                            hit = entry_at_row(entries, rows, y)
+                            if not hit:
+                                continue
+                            if hit == selected_name:
+                                mnu = build_menu(kind, cwd, hit, entries, last.get("pid"))
+                                if mnu:
+                                    menu_actions = mnu["actions"]
+                                    menu_title = mnu["title"]
+                                    menu_open = True
+                                stale = True
+                            else:
+                                selected_name = hit
+                                stale = True
+                    inbuf = inbuf[end:]
+                    # arrow keys: in the listing up/down move, right descends into
+                    # a dir / previews a file, left ascends to the parent; in a
+                    # preview up/down scroll and left goes back.
+                    for km in KEY_RE.finditer(inbuf):
+                        if menu_open:
+                            continue
+                        c = km.group()[-1:]
+                        if preview:
+                            if c == b"A":
+                                preview_offset = max(0, preview_offset - 1)
+                                stale = True
+                            elif c == b"B":
+                                preview_offset += 1
+                                stale = True
+                            elif c == b"D":
+                                preview = None
+                                preview_offset = 0
+                                stale = True
+                        elif c == b"A":
+                            move(-1)
+                        elif c == b"B":
+                            move(1)
+                        elif c == b"C" and selected_name and kind == "local" and cwd:
+                            rec = next((e for e in entries if e["name"] == selected_name), None)
+                            if rec:
+                                if rec["dir"]:
+                                    browse_cwd = os.path.join(cwd, rec["token"].rstrip(_INDICATORS))
+                                else:
+                                    preview = os.path.join(cwd, rec["token"].rstrip(_INDICATORS))
+                                    preview_offset = 0
+                                stale = True
+                        elif c == b"D" and kind == "local" and cwd:
+                            browse_cwd = os.path.dirname(cwd) or cwd
+                            stale = True
+                    inbuf = KEY_RE.sub(b"", inbuf)
+                    # discard non-escape leftovers; keep a possible partial seq
+                    if inbuf and not inbuf.startswith(b"\x1b"):
+                        inbuf = b""
+                    if len(inbuf) > 512:
+                        inbuf = inbuf[-512:]
+                else:
+                    time.sleep(0.1)  # EOF on stdin (pane closing) — avoid busy loop
     except KeyboardInterrupt:
         pass
     finally:
