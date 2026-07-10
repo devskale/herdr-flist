@@ -3,6 +3,16 @@
 All notable changes to herdr-flist. Versions follow the manifest `version` field
 in `herdr-plugin.toml`.
 
+## 0.4.0
+
+- **Settings:** a `\u2699` in the footer opens an in-pane settings overlay with
+  live toggles — Show hidden files, Git status, Dirs first, and **Last edited
+  first** (sort by mtime, newest first via `ls -t`). Click a row to toggle
+  (the overlay stays open), click away to close.
+- **Enter** on a selected entry opens it: a directory descends (same as \u2192),
+  a file opens with the system default app (`open` on macOS, `xdg-open` on
+  Linux).
+
 ## 0.3.0
 
 - **Interactive filelist** — the pane is now navigable, not just a display:

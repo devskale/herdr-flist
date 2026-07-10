@@ -60,9 +60,11 @@ herdr plugin action invoke open --plugin herdr-flist
   directory or opens an **in-pane preview** of a file (filename as the title,
   content beneath; ↑/↓ scroll, ← or click goes back); ← ascends to the parent
   directory. Browsing is local-only and resumes following when you focus
-  another pane. The pane enables SGR mouse reporting, so — as in any terminal
-  multiplexer — the first click on an unfocused filelist only focuses it;
-  subsequent clicks select.
+  another pane. A `\u2699` in the footer opens a settings overlay (show hidden
+  files / git status / dirs first / last-edited first). `Enter` opens the
+  selected entry (dir descends, file opens with the default app). The pane
+  enables SGR mouse reporting, so — as in any terminal multiplexer — the first
+  click on an unfocused filelist only focuses it; subsequent clicks select.
 
 The pane is a normal Herdr pane after creation. The plugin does not clean it up
 or manage its lifecycle.

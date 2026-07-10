@@ -1,6 +1,6 @@
 id = "herdr-flist"
 name = "Filelist Row"
-version = "0.3.0"
+version = "0.4.0"
 min_herdr_version = "0.7.0"
 description = "A filelist row that follows the focused pane's cwd — locally or over SSH."
 platforms = ["linux", "macos"]

@@ -49,6 +49,9 @@ ME_ID = os.environ.get("HERDR_PANE_ID", "")  # this pane's own id (visibility ga
 
 _SHELLS = {"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "csh", "ash", "nu"}
 
+# Runtime display settings (toggled via the footer gear).
+_OPT = {"hidden": True, "git": True, "dirs": True, "mtime": False}
+
 # --- ANSI -----------------------------------------------------------------
 R = "\033[0m"
 DIM = "\033[2m"
@@ -405,7 +408,9 @@ def git_info(cwd):
 # --- entry rendering ------------------------------------------------------
 def _sort_key(entry):
     name = entry.rstrip(_INDICATORS).lower()
-    return (0 if entry.endswith("/") else 1, name)
+    if _OPT.get("dirs", True):
+        return (0 if entry.endswith("/") else 1, name)
+    return (name,)
 
 
 def render_entries(raw, gmap, width, cwd=None):
@@ -417,7 +422,10 @@ def render_entries(raw, gmap, width, cwd=None):
     """
     max_name = max(1, width - 2)
     out = []
-    for entry in sorted((e for e in raw.splitlines() if e), key=_sort_key):
+    items = [e for e in raw.splitlines() if e]
+    if not _OPT.get("mtime"):  # mtime order arrives pre-sorted from `ls -t`
+        items.sort(key=_sort_key)
+    for entry in items:
         base = entry.rstrip(_INDICATORS)
         code = None
         if gmap:
@@ -508,10 +516,12 @@ def footer(width, n_items, branch):
         shown.append(f"{CYAN}{branch}{R}")
     sep = "  "
     text = sep.join(plain)
-    if len(text) > width:
-        return f"{DIM}{ellipsize(text, width)}{R}"
-    pad = max(0, width - len(text))
-    return sep.join(shown) + " " * pad
+    avail = max(1, width - 2)  # reserve " \u2699" (space + gear) at the end
+    if len(text) > avail:
+        text = ellipsize(text, avail)
+        shown = [f"{DIM}{text}{R}"]
+    pad = max(0, avail - len(text))
+    return sep.join(shown) + " " * pad + f" {DIM}\u2699{R}"
 
 
 def _menu_lines(title, labels, cols):
@@ -644,11 +654,33 @@ def build_menu(kind, cwd, name, entries, followed_pid):
     }
 
 
+def settings_actions():
+    """Toggle items shown in the footer-gear settings overlay."""
+    mark = lambda on: "\u2713" if on else "\u2022"
+    return [
+        {"label": f"{mark(_OPT['hidden'])} Show hidden files", "op": "toggle", "key": "hidden"},
+        {"label": f"{mark(_OPT['git'])} Git status", "op": "toggle", "key": "git"},
+        {"label": f"{mark(_OPT['dirs'])} Dirs first", "op": "toggle", "key": "dirs"},
+        {"label": f"{mark(_OPT['mtime'])} Last edited first", "op": "toggle", "key": "mtime"},
+    ]
+
+
+def open_default(path):
+    """Open a path with the system default app (macOS `open` / Linux `xdg-open`)."""
+    cmd = ["open"] if sys.platform == "darwin" else ["xdg-open"]
+    try:
+        subprocess.Popen(cmd + [path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
 def run_action(act):
     """Execute a menu action. Failures are swallowed (best-effort)."""
     try:
         op = act.get("op")
-        if op == "copy":
+        if op == "toggle":
+            _OPT[act["key"]] = not _OPT.get(act["key"], True)
+        elif op == "copy":
             copy_to_clipboard(act["path"])
         elif op == "cd_into":
             subprocess.run(
@@ -725,6 +757,7 @@ def main():
     menu_open = False
     menu_actions: list = []
     menu_title = ""
+    settings_open = False
     inbuf = b""
 
     narrow_self()
@@ -831,10 +864,11 @@ def main():
                 if not os.path.isdir(cwd):
                     entries = _msg("(not a directory)")
                 else:
-                    gmap, branch = git_info(cwd)
+                    gmap, branch = (git_info(cwd) if _OPT["git"] else ({}, None))
+                    ls_flag = ("-FA1" if _OPT["hidden"] else "-F1") + ("t" if _OPT["mtime"] else "")
                     try:
                         raw = subprocess.run(
-                            ["ls", "-FA1", "--color=never"], cwd=cwd,
+                            ["ls", ls_flag, "--color=never"], cwd=cwd,
                             capture_output=True, text=True,
                         ).stdout
                     except Exception:
@@ -852,7 +886,8 @@ def main():
             if selected_path != title_path:
                 selected_name = None
                 selected_path = title_path
-                menu_open = False
+                if not settings_open:  # settings (display prefs) survive a view change
+                    menu_open = False
                 preview = None
                 preview_offset = 0
 
@@ -864,6 +899,9 @@ def main():
             if pid and kind:
                 last = {"pid": pid, "cwd": cwd, "kind": kind, "ssh": ssh_target}
 
+            if settings_open:
+                menu_actions = settings_actions()
+                menu_title = "settings"
             k = len(menu_actions) if menu_open else 0
             menu = ({"title": menu_title, "labels": [a["label"] for a in menu_actions]}
                     if menu_open else None)
@@ -899,8 +937,16 @@ def main():
                         if m.group(4) != b"M":  # button press only
                             continue
                         button = int(m.group(1)) & 3
+                        x = int(m.group(2))
                         y = int(m.group(3))
                         if button != 0:  # left click only
+                            continue
+                        if y == rows and x >= cols - 1:  # footer gear -> settings
+                            settings_open = True
+                            menu_open = True
+                            menu_title = "settings"
+                            menu_actions = settings_actions()
+                            stale = True
                             continue
                         if preview:  # any click exits the in-pane preview
                             preview = None
@@ -911,7 +957,11 @@ def main():
                             idx = menu_action_at_row(rows, len(menu_actions), y)
                             if idx is not None:
                                 run_action(menu_actions[idx])
-                            menu_open = False
+                                if not settings_open:  # action menu closes; settings stays open
+                                    menu_open = False
+                            else:
+                                menu_open = False
+                                settings_open = False
                             stale = True
                         else:
                             hit = entry_at_row(entries, rows, y)
@@ -923,6 +973,7 @@ def main():
                                     menu_actions = mnu["actions"]
                                     menu_title = mnu["title"]
                                     menu_open = True
+                                    settings_open = False
                                 stale = True
                             else:
                                 selected_name = hit
@@ -963,6 +1014,17 @@ def main():
                             browse_cwd = os.path.dirname(cwd) or cwd
                             stale = True
                     inbuf = KEY_RE.sub(b"", inbuf)
+                    # Enter: open the selected entry (dir: descend; file: default app)
+                    if b"\r" in inbuf or b"\n" in inbuf:
+                        inbuf = inbuf.replace(b"\r", b"", 1) if b"\r" in inbuf else inbuf.replace(b"\n", b"", 1)
+                        if not menu_open and not preview and selected_name and kind == "local" and cwd:
+                            rec = next((e for e in entries if e["name"] == selected_name), None)
+                            if rec:
+                                if rec["dir"]:
+                                    browse_cwd = os.path.join(cwd, rec["token"].rstrip(_INDICATORS))
+                                else:
+                                    open_default(os.path.join(cwd, rec["token"].rstrip(_INDICATORS)))
+                                stale = True
                     # discard non-escape leftovers; keep a possible partial seq
                     if inbuf and not inbuf.startswith(b"\x1b"):
                         inbuf = b""
