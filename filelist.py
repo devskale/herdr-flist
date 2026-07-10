@@ -34,6 +34,7 @@ import subprocess
 import sys
 import termios
 import time
+from collections import OrderedDict
 
 HERDR = os.environ.get("HERDR_BIN_PATH", "herdr")
 INTERVAL = float(os.environ.get("HERDR_FILELIST_INTERVAL", "1"))
@@ -51,6 +52,14 @@ _SHELLS = {"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "csh", "ash", "nu
 
 # Runtime display settings (toggled via the footer gear).
 _OPT = {"hidden": True, "git": True, "dirs": True, "mtime": False}
+
+# Internal caps (named instead of magic numbers).
+_STDIN_BUF_CAP = 512
+_PREVIEW_MAX_LINES = 20_000
+_PREVIEW_MAX_BYTES = 2_000_000
+_PREVIEW_CACHE_CAP = 64
+_REMOTE_CACHE_CAP = 32
+_SYMLINK_DIR_CACHE_CAP = 256
 
 # --- ANSI -----------------------------------------------------------------
 R = "\033[0m"
@@ -82,13 +91,24 @@ MOUSE_RE = re.compile(rb"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
 KEY_RE = re.compile(rb"\x1b(?:\[|O)[ABCD]")
 
 # --- herdr CLI helpers -----------------------------------------------------
+def _dbg(msg):
+    """Env-gated debug log to a file (stderr would corrupt the TUI pane)."""
+    if not os.environ.get("HERDR_FILELIST_DEBUG"):
+        return
+    try:
+        with open("/tmp/herdr-flist-debug.log", "a") as f:
+            f.write(msg + "\n")
+    except OSError:
+        pass
+
+
 def herdr_json(args: list[str]):
     try:
         out = subprocess.run(
             [HERDR, *args], capture_output=True, text=True
         ).stdout
         return json.loads(out)
-    except Exception:
+    except (subprocess.SubprocessError, OSError, ValueError):
         return None
 
 
@@ -216,7 +236,7 @@ def remote_home(dest):
                 capture_output=True, text=True, timeout=SSH_TIMEOUT,
             )
             _remote_home[dest] = (r.stdout.strip() or None)
-        except Exception:
+        except (subprocess.SubprocessError, OSError):
             _remote_home[dest] = None
     return _remote_home[dest]
 
@@ -251,9 +271,12 @@ def render_remote(dest, path):
              dest, remote_cmd],
             capture_output=True, text=True, timeout=SSH_TIMEOUT,
         ).stdout
-    except Exception:
+    except (subprocess.SubprocessError, OSError):
         out = ""
     _remote_cache[key] = (out, now + REMOTE_CACHE)
+    if len(_remote_cache) > _REMOTE_CACHE_CAP:  # prune expired entries
+        for stale in [k for k, v in _remote_cache.items() if v[1] <= now]:
+            _remote_cache.pop(stale, None)
     return out
 
 
@@ -263,7 +286,7 @@ def pane_size():
     try:
         sz = shutil.get_terminal_size((80, 24))
         return sz.columns, sz.lines
-    except Exception:
+    except OSError:
         return 80, 24
 
 
@@ -359,7 +382,7 @@ def git_info(cwd):
             ["git", "-C", cwd, "status", "--porcelain=v1", "-b"],
             capture_output=True, text=True,
         ).stdout
-    except Exception:
+    except (subprocess.SubprocessError, OSError):
         return {}, None
     lines = st.splitlines()
     branch = None
@@ -413,6 +436,28 @@ def _sort_key(entry):
     return (name,)
 
 
+# (cwd, name) -> is_dir, capped; symlink targets rarely flip, so we don't bust
+# per-tick — the cap keeps memory bounded.
+_symlink_dir_cache: dict[tuple[str, str], bool] = {}
+
+
+def _is_symlink_dir(cwd, base):
+    """True if `base` (a symlink, local) resolves to a directory. Cached."""
+    if not cwd:
+        return False
+    key = (cwd, base)
+    hit = _symlink_dir_cache.get(key)
+    if hit is None:
+        try:
+            hit = os.path.isdir(os.path.join(cwd, base))
+        except OSError:
+            hit = False
+        _symlink_dir_cache[key] = hit
+        if len(_symlink_dir_cache) > _SYMLINK_DIR_CACHE_CAP:
+            _symlink_dir_cache.pop(next(iter(_symlink_dir_cache)))
+    return hit
+
+
 def render_entries(raw, gmap, width, cwd=None):
     """Turn raw `ls -FA1` output into dirs-first entry records.
 
@@ -421,10 +466,10 @@ def render_entries(raw, gmap, width, cwd=None):
     `@`, not `/`.
     """
     max_name = max(1, width - 2)
-    out = []
     items = [e for e in raw.splitlines() if e]
     if not _OPT.get("mtime"):  # mtime order arrives pre-sorted from `ls -t`
         items.sort(key=_sort_key)
+    out = []
     for entry in items:
         base = entry.rstrip(_INDICATORS)
         code = None
@@ -435,12 +480,7 @@ def render_entries(raw, gmap, width, cwd=None):
                     (v for k, v in gmap.items() if k.startswith(base + "/")), None
                 )
         token = fit_entry(entry, max_name)
-        is_dir = entry.endswith("/")
-        if not is_dir and cwd and entry.endswith("@"):
-            try:
-                is_dir = os.path.isdir(os.path.join(cwd, base))
-            except Exception:
-                pass
+        is_dir = entry.endswith("/") or _is_symlink_dir(cwd, base)
         out.append({
             "line": git_gutter(code) + style_name(token),
             "token": token,
@@ -473,13 +513,13 @@ def _row_line(rec, cols, selected_name, hint):
     return rec["line"]
 
 
-def entry_at_row(entries, rows, r, menu_open=False, k=0):
+def entry_at_row(entries, rows, r):
     """Base name of the selectable entry at 1-based pane row `r`, else None."""
     if r < 2 or rows < 3:
         return None
-    entry_rows = max(0, rows - 2 - (k + 1 if menu_open else 0))
-    more = len(entries) > entry_rows
-    show_count = (entry_rows - 1) if more else entry_rows
+    avail = rows - 2
+    more = len(entries) > avail
+    show_count = (avail - 1) if more else avail
     show_count = max(0, min(show_count, len(entries)))
     idx = r - 2
     if 0 <= idx < show_count:
@@ -616,7 +656,7 @@ def copy_to_clipboard(text: str) -> bool:
             if shutil.which(cmd[0]):
                 subprocess.run(cmd, input=text.encode(), capture_output=True)
                 return True
-        except Exception:
+        except (subprocess.SubprocessError, OSError):
             pass
     return False
 
@@ -670,8 +710,8 @@ def open_default(path):
     cmd = ["open"] if sys.platform == "darwin" else ["xdg-open"]
     try:
         subprocess.Popen(cmd + [path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
+    except OSError as e:
+        _dbg(f"open_default {path}: {e}")
 
 
 def run_action(act):
@@ -697,7 +737,7 @@ def run_action(act):
             new_id = None
             try:
                 new_id = _extract_pane_id(json.loads(r.stdout))
-            except Exception:
+            except (ValueError, AttributeError):
                 pass
             if not act["is_dir"] and new_id:
                 subprocess.run(
@@ -705,42 +745,58 @@ def run_action(act):
                      f"{OPENER} {shlex.quote(os.path.basename(act['path']))}"],
                     capture_output=True,
                 )
-    except Exception:
-        pass
+    except Exception as e:  # action dispatch spans subprocess + json + paths
+        _dbg(f"run_action {act.get('op')}: {e}")
 
 
-_preview_cache: dict[str, tuple[float, list[str] | None]] = {}
+_preview_cache: OrderedDict[str, tuple[float, list[str] | None]] = OrderedDict()
 
 
-def read_text_file(path, max_lines=20000):
-    """Return text lines of a file, or None if it is binary / unreadable."""
+def read_text_file(path, max_lines=_PREVIEW_MAX_LINES, max_bytes=_PREVIEW_MAX_BYTES):
+    """Return text lines of a file, or None if it is binary / unreadable.
+
+    Capped by both line count and total bytes (a single huge line won't blow
+    memory).
+    """
     try:
         with open(path, "rb") as f:
             if b"\x00" in f.read(2048):
                 return None
         lines = []
+        total = 0
+        truncated = False
         with open(path, "r", errors="replace") as f:
             for _ in range(max_lines):
                 ln = f.readline()
                 if not ln:
                     break
+                total += len(ln)
                 lines.append(ln.rstrip("\n").replace("\t", "    "))
+                if total >= max_bytes:
+                    truncated = True
+                    break
+        if truncated:
+            lines.append("… (truncated)")
         return lines
-    except Exception:
+    except OSError:
         return None
 
 
 def get_preview_lines(path):
-    """Cached text lines for `path`, keyed on mtime."""
+    """Cached text lines for `path`, keyed on mtime. Bounded LRU."""
     try:
         mtime = os.path.getmtime(path)
-    except Exception:
+    except OSError:
         return None
     cached = _preview_cache.get(path)
     if cached and cached[0] == mtime:
+        _preview_cache.move_to_end(path)
         return cached[1]
     lines = read_text_file(path)
     _preview_cache[path] = (mtime, lines)
+    _preview_cache.move_to_end(path)
+    while len(_preview_cache) > _PREVIEW_CACHE_CAP:
+        _preview_cache.popitem(last=False)
     return lines
 
 
@@ -749,15 +805,21 @@ def main():
     last = {"pid": None, "cwd": None, "kind": None, "ssh": None}
     last_render = ""
     stale = True
-    selected_name: str | None = None
-    selected_path: str | None = None
-    preview: str | None = None        # abspath being previewed (in-pane viewer)
+    # --- view / interaction state -------------------------------------------
+    # The "mode" is the product of these flags (no enum: they aren't mutually
+    # exclusive — settings layers over the menu overlay, browse_cwd layers over
+    # the listing/preview). Input handlers (handle_click/handle_arrow/
+    # handle_enter) branch on them. `last` holds the followed pane so self-focus
+    # can keep showing it.
+    selected_name: str | None = None   # entry name selected in the listing
+    selected_path: str | None = None   # the view path `selected_name` belongs to
+    preview: str | None = None         # abspath being previewed (in-pane viewer)
     preview_offset = 0
-    browse_cwd: str | None = None     # when self-focused + local, overrides the followed cwd
-    menu_open = False
+    browse_cwd: str | None = None      # self-focused + local: overrides followed cwd
+    menu_open = False                  # bottom overlay open (action menu OR settings)
     menu_actions: list = []
     menu_title = ""
-    settings_open = False
+    settings_open = False              # the overlay is the settings panel
     inbuf = b""
 
     narrow_self()
@@ -767,7 +829,7 @@ def main():
 
     try:
         stdin_fd = sys.stdin.buffer.fileno()
-    except Exception:
+    except (OSError, ValueError):
         stdin_fd = -1
 
     # Put the PTY into non-canonical mode so mouse/keypress bytes arrive
@@ -783,14 +845,14 @@ def main():
             tc[6][termios.VMIN] = 0
             tc[6][termios.VTIME] = 0
             termios.tcsetattr(stdin_fd, termios.TCSANOW, tc)
-        except Exception:
+        except OSError:
             saved_tc = None
 
     def restore():
         if saved_tc is not None:
             try:
                 termios.tcsetattr(stdin_fd, termios.TCSANOW, saved_tc)
-            except Exception:
+            except OSError:
                 pass
         sys.stdout.write("\033[?1006l\033[?1000l\033[?7h\033[?25h")
         sys.stdout.flush()
@@ -804,6 +866,100 @@ def main():
         cur = names.index(selected_name) if selected_name in names else None
         cur = 0 if cur is None else max(0, min(len(names) - 1, cur + delta))
         selected_name = names[cur]
+        stale = True
+
+    def _selected():
+        """(abspath, rec) of the current selection, or (None, None)."""
+        if not cwd:
+            return None, None
+        rec = next((e for e in entries if e["name"] == selected_name), None)
+        if not rec:
+            return None, None
+        return os.path.join(cwd, rec["token"].rstrip(_INDICATORS)), rec
+
+    def handle_click(x, y):
+        nonlocal selected_name, menu_open, menu_actions, menu_title
+        nonlocal settings_open, preview, preview_offset, stale
+        if y == rows and x >= cols - 1:  # footer gear -> settings
+            settings_open = menu_open = True
+            menu_title = "settings"
+            menu_actions = settings_actions()
+            stale = True
+            return
+        if preview:  # any click exits the in-pane preview
+            preview = None
+            preview_offset = 0
+            stale = True
+            return
+        if menu_open:
+            idx = menu_action_at_row(rows, len(menu_actions), y)
+            if idx is not None:
+                run_action(menu_actions[idx])
+                if not settings_open:  # action menu closes; settings stays open
+                    menu_open = False
+            else:
+                menu_open = False
+                settings_open = False
+            stale = True
+            return
+        hit = entry_at_row(entries, rows, y)
+        if not hit:
+            return
+        if hit == selected_name:  # second click on the selected entry -> menu
+            mnu = build_menu(kind, cwd, hit, entries, last.get("pid"))
+            if mnu:
+                menu_actions = mnu["actions"]
+                menu_title = mnu["title"]
+                menu_open = True
+                settings_open = False
+            stale = True
+        else:
+            selected_name = hit
+            stale = True
+
+    def handle_arrow(c):
+        """c is b'A'/'B'/'C'/'D' (up/down/right/left)."""
+        nonlocal preview, preview_offset, browse_cwd, stale
+        if preview:
+            if c == b"A":
+                preview_offset = max(0, preview_offset - 1)
+                stale = True
+            elif c == b"B":
+                preview_offset += 1
+                stale = True
+            elif c == b"D":  # left: leave the preview
+                preview = None
+                preview_offset = 0
+                stale = True
+            return
+        if c == b"A":
+            move(-1)
+        elif c == b"B":
+            move(1)
+        elif c == b"C" and kind == "local" and cwd:
+            path, rec = _selected()
+            if rec:
+                if rec["dir"]:
+                    browse_cwd = path             # descend
+                else:
+                    preview = path               # in-pane preview
+                    preview_offset = 0
+                stale = True
+        elif c == b"D" and kind == "local" and cwd:
+            browse_cwd = os.path.dirname(cwd) or cwd  # ascend
+            stale = True
+
+    def handle_enter():
+        nonlocal browse_cwd, stale
+        if menu_open or preview or kind != "local" or not cwd:
+            return
+        path, rec = _selected()
+        if not rec:
+            return
+        if rec["dir"]:
+            browse_cwd = path                    # descend
+        else:
+            open_default(path)                   # system default app
         stale = True
 
     try:
@@ -838,8 +994,10 @@ def main():
             kind = cwd = ssh_target = None
 
             if self_focused:
-                # the filelist pane itself is focused: hold the last real view,
-                # or the directory we browsed into (local only).
+                # The filelist pane itself is focused: hold the last real view.
+                # NOTE: pid/cwd/kind are intentionally rebound here from "the
+                # focused pane" to "the followed view" — the rest of the loop
+                # treats them as the current view's source.
                 pid = last["pid"]
                 kind = last["kind"]
                 ssh_target = last.get("ssh")
@@ -868,10 +1026,10 @@ def main():
                     ls_flag = ("-FA1" if _OPT["hidden"] else "-F1") + ("t" if _OPT["mtime"] else "")
                     try:
                         raw = subprocess.run(
-                            ["ls", ls_flag, "--color=never"], cwd=cwd,
+                            ["ls", ls_flag], cwd=cwd,
                             capture_output=True, text=True,
                         ).stdout
-                    except Exception:
+                    except OSError:
                         raw = ""
                     entries = render_entries(raw, gmap, cols, cwd) or _msg("(empty)")
             elif kind == "ssh" and ssh_target:
@@ -934,102 +1092,22 @@ def main():
                     end = 0
                     for m in MOUSE_RE.finditer(inbuf):
                         end = m.end()
-                        if m.group(4) != b"M":  # button press only
-                            continue
-                        button = int(m.group(1)) & 3
-                        x = int(m.group(2))
-                        y = int(m.group(3))
-                        if button != 0:  # left click only
-                            continue
-                        if y == rows and x >= cols - 1:  # footer gear -> settings
-                            settings_open = True
-                            menu_open = True
-                            menu_title = "settings"
-                            menu_actions = settings_actions()
-                            stale = True
-                            continue
-                        if preview:  # any click exits the in-pane preview
-                            preview = None
-                            preview_offset = 0
-                            stale = True
-                            continue
-                        if menu_open:
-                            idx = menu_action_at_row(rows, len(menu_actions), y)
-                            if idx is not None:
-                                run_action(menu_actions[idx])
-                                if not settings_open:  # action menu closes; settings stays open
-                                    menu_open = False
-                            else:
-                                menu_open = False
-                                settings_open = False
-                            stale = True
-                        else:
-                            hit = entry_at_row(entries, rows, y)
-                            if not hit:
-                                continue
-                            if hit == selected_name:
-                                mnu = build_menu(kind, cwd, hit, entries, last.get("pid"))
-                                if mnu:
-                                    menu_actions = mnu["actions"]
-                                    menu_title = mnu["title"]
-                                    menu_open = True
-                                    settings_open = False
-                                stale = True
-                            else:
-                                selected_name = hit
-                                stale = True
+                        if m.group(4) == b"M" and (int(m.group(1)) & 3) == 0:
+                            handle_click(int(m.group(2)), int(m.group(3)))
                     inbuf = inbuf[end:]
-                    # arrow keys: in the listing up/down move, right descends into
-                    # a dir / previews a file, left ascends to the parent; in a
-                    # preview up/down scroll and left goes back.
                     for km in KEY_RE.finditer(inbuf):
-                        if menu_open:
-                            continue
-                        c = km.group()[-1:]
-                        if preview:
-                            if c == b"A":
-                                preview_offset = max(0, preview_offset - 1)
-                                stale = True
-                            elif c == b"B":
-                                preview_offset += 1
-                                stale = True
-                            elif c == b"D":
-                                preview = None
-                                preview_offset = 0
-                                stale = True
-                        elif c == b"A":
-                            move(-1)
-                        elif c == b"B":
-                            move(1)
-                        elif c == b"C" and selected_name and kind == "local" and cwd:
-                            rec = next((e for e in entries if e["name"] == selected_name), None)
-                            if rec:
-                                if rec["dir"]:
-                                    browse_cwd = os.path.join(cwd, rec["token"].rstrip(_INDICATORS))
-                                else:
-                                    preview = os.path.join(cwd, rec["token"].rstrip(_INDICATORS))
-                                    preview_offset = 0
-                                stale = True
-                        elif c == b"D" and kind == "local" and cwd:
-                            browse_cwd = os.path.dirname(cwd) or cwd
-                            stale = True
+                        if not menu_open:
+                            handle_arrow(km.group()[-1:])
                     inbuf = KEY_RE.sub(b"", inbuf)
-                    # Enter: open the selected entry (dir: descend; file: default app)
-                    if b"\r" in inbuf or b"\n" in inbuf:
-                        inbuf = inbuf.replace(b"\r", b"", 1) if b"\r" in inbuf else inbuf.replace(b"\n", b"", 1)
-                        if not menu_open and not preview and selected_name and kind == "local" and cwd:
-                            rec = next((e for e in entries if e["name"] == selected_name), None)
-                            if rec:
-                                if rec["dir"]:
-                                    browse_cwd = os.path.join(cwd, rec["token"].rstrip(_INDICATORS))
-                                else:
-                                    open_default(os.path.join(cwd, rec["token"].rstrip(_INDICATORS)))
-                                stale = True
+                    if b"\r" in inbuf or b"\n" in inbuf:  # Enter
+                        inbuf = (inbuf.replace(b"\r", b"", 1) if b"\r" in inbuf
+                                 else inbuf.replace(b"\n", b"", 1))
+                        handle_enter()
                     # discard non-escape leftovers; keep a possible partial seq
                     if inbuf and not inbuf.startswith(b"\x1b"):
                         inbuf = b""
-                    if len(inbuf) > 512:
-                        inbuf = inbuf[-512:]
+                    if len(inbuf) > _STDIN_BUF_CAP:
+                        inbuf = inbuf[-_STDIN_BUF_CAP:]
                 else:
                     time.sleep(0.1)  # EOF on stdin (pane closing) — avoid busy loop
     except KeyboardInterrupt:

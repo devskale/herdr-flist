@@ -48,7 +48,9 @@ herdr plugin action invoke open --plugin herdr-flist
   with the item count and git branch.
 - SSH panes: Herdr drops remote-host cwd reporting, so the remote cwd is parsed
   from the focused pane's own shell prompt and listed over `ssh`. This is what
-  lets the view follow the remote shell into subdirectories.
+  lets the view follow the remote shell into subdirectories. The interactive
+  features (browse, in-pane preview, settings toggles, Enter-open) are
+  **local-only** — over SSH the pane is a read-only listing.
 - Update gating: the listing only refreshes while its pane is on screen (the
   focused pane's tab); a background tab pauses and refreshes the moment you
   return. Clicking the filelist pane itself doesn't change the view — it holds

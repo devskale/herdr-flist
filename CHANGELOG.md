@@ -3,6 +3,19 @@
 All notable changes to herdr-flist. Versions follow the manifest `version` field
 in `herdr-plugin.toml`.
 
+## 0.4.1
+
+Hardening pass (no behavior change for users):
+- tests: `test_filelist.py` (24 unit tests on the pure helpers).
+- bound the preview cache (bounded LRU) and prune the remote cache.
+- `read_text_file` caps bytes (not just lines) and marks truncation.
+- extracted the input layer from `main()` into `handle_click` / `handle_arrow` /
+  `handle_enter`; the poll loop is now a short read→dispatch.
+- dropped the redundant `ls --color=never` (piped `ls` never colorizes).
+- cached symlink→dir resolution; hoisted magic numbers to named constants.
+- narrowed broad `except Exception` to specific types; added an env-gated
+  `_dbg` log for action failures.
+
 ## 0.4.0
 
 - **Settings:** a `\u2699` in the footer opens an in-pane settings overlay with
